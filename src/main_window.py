@@ -1,15 +1,18 @@
+# Version constant at the top
+__version__ = "0.23.0"
+
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                               QPushButton, QLabel, QFileDialog, QTextEdit,
                               QProgressBar, QMessageBox, QGroupBox, QTabWidget,
-                              QListWidget, QListWidgetItem, QFrame,
-                              QFormLayout, QCheckBox, QComboBox,
+                              QListWidget, QListWidgetItem,
+                              QFormLayout, QCheckBox,
                               QSizePolicy, QSpacerItem, QSplitter, QToolBar,
                               QStatusBar, QMenu, QMenuBar, QDialog, QDialogButtonBox,
                               QRadioButton, QButtonGroup, QTreeWidget, QTreeWidgetItem,
                               QHeaderView, QScrollArea, QTableWidget,
                               QTableWidgetItem, QAbstractItemView)
-from PySide6.QtCore import Qt, QThread, Signal, QSize
-from PySide6.QtGui import QFont, QIcon, QPalette, QColor, QAction
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QFont, QIcon, QAction
 import subprocess
 import tarfile
 import os
@@ -23,7 +26,6 @@ import configparser
 import re
 
 class WelcomeDialog(QDialog):
-    """Welcome dialog shown on first launch"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setup_ui()
@@ -43,10 +45,9 @@ class WelcomeDialog(QDialog):
         header.setAlignment(Qt.AlignCenter)
         layout.addWidget(header)
         
-        info_text = QLabel("""
+        info_text = QLabel(f"""
         <div style='line-height: 1.6;'>
-        <h3>Important Information About Tarballs</h3>
-        
+        <h3>Tarball Installer v{__version__}</h3>
         <p><b>You don't always need to install tarballs!</b></p>
         
         <p>Most applications in tarball format can be run directly from their extracted folder. 
@@ -72,7 +73,6 @@ class WelcomeDialog(QDialog):
         </div>
         """)
         info_text.setWordWrap(True)
-        info_text.setOpenExternalLinks(True)
         
         scroll = QScrollArea()
         scroll.setWidget(info_text)
@@ -93,56 +93,17 @@ class WelcomeDialog(QDialog):
         button_box.accepted.connect(self.accept)
         layout.addWidget(button_box)
 
-class BinarySelectionDialog(QDialog):
-    """Dialog for manually selecting the main binary"""
-    def __init__(self, binaries, parent=None):
-        super().__init__(parent)
-        self.binaries = binaries
-        self.selected_binary = None
-        self.setup_ui()
-        
-    def setup_ui(self):
-        self.setWindowTitle("Select Main Executable")
-        self.setFixedSize(500, 400)
-        
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        
-        info_label = QLabel("Multiple executables found. Please select the main application:")
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
-        
-        self.binary_list = QListWidget()
-        for binary in self.binaries:
-            item = QListWidgetItem(os.path.basename(binary))
-            item.setToolTip(binary)
-            self.binary_list.addItem(item)
-        
-        self.binary_list.itemDoubleClicked.connect(self.accept_selection)
-        layout.addWidget(self.binary_list)
-        
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.accepted.connect(self.accept_selection)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-        
-    def accept_selection(self):
-        selected = self.binary_list.currentItem()
-        if selected:
-            index = self.binary_list.row(selected)
-            self.selected_binary = self.binaries[index]
-            self.accept()
-
 class InstallerThread(QThread):
     progress = Signal(str, int)
     log = Signal(str)
     finished = Signal(bool, str, dict)
     
-    def __init__(self, tarball_path, options, selected_binary=None):
+    def __init__(self, tarball_path, options, selected_binary=None, extracted_dir=None):
         super().__init__()
         self.tarball_path = tarball_path
         self.options = options
         self.selected_binary = selected_binary
+        self.extracted_dir = extracted_dir  # NEW: Reuse existing extraction
         self.temp_dir = None
         self.installation_data = {}
         
@@ -158,24 +119,30 @@ class InstallerThread(QThread):
                 'files_installed': [],
                 'desktop_entries': [],
                 'binaries': [],
-                'marker_files': []
+                'marker_files': [],
+                'installer_version': __version__
             }
             
             self.log.emit(f"Starting installation of {os.path.basename(self.tarball_path)}")
             
-            self.temp_dir = tempfile.mkdtemp(prefix="tarball_installer_")
-            self.progress.emit("Preparing installation...", 10)
-            
-            # Extract tarball
-            self.log.emit(f"Extracting to temporary directory: {self.temp_dir}")
-            with tarfile.open(self.tarball_path, 'r:*') as tar:
-                members = tar.getmembers()
-                total_members = len(members)
-                for i, member in enumerate(members):
-                    tar.extract(member, self.temp_dir)
-                    if i % 10 == 0:
-                        progress = 10 + int((i / total_members) * 60)
-                        self.progress.emit(f"Extracting files...", progress)
+            # If we have an extracted directory, reuse it
+            if self.extracted_dir and os.path.exists(self.extracted_dir):
+                self.temp_dir = self.extracted_dir
+                self.progress.emit("Using existing extraction...", 30)
+            else:
+                # Otherwise extract fresh
+                self.temp_dir = tempfile.mkdtemp(prefix="tarball_installer_")
+                self.progress.emit("Preparing installation...", 10)
+                
+                self.log.emit(f"Extracting to temporary directory: {self.temp_dir}")
+                with tarfile.open(self.tarball_path, 'r:*') as tar:
+                    members = tar.getmembers()
+                    total_members = len(members)
+                    for i, member in enumerate(members):
+                        tar.extract(member, self.temp_dir)
+                        if i % 10 == 0:
+                            progress = 10 + int((i / total_members) * 60)
+                            self.progress.emit(f"Extracting files...", progress)
             
             self.progress.emit("Analyzing package contents...", 70)
             
@@ -203,8 +170,10 @@ class InstallerThread(QThread):
             
             self.progress.emit("Cleaning up...", 95)
             
-            if self.temp_dir and os.path.exists(self.temp_dir):
-                shutil.rmtree(self.temp_dir)
+            # Only clean up if we created a new temp dir (not if we reused one)
+            if self.temp_dir and not self.extracted_dir:
+                if os.path.exists(self.temp_dir):
+                    shutil.rmtree(self.temp_dir)
             
             self.progress.emit("Installation complete!", 100)
             self.finished.emit(True, "Application installed successfully!", self.installation_data)
@@ -212,201 +181,6 @@ class InstallerThread(QThread):
         except Exception as e:
             self.log.emit(f"Error: {str(e)}")
             self.finished.emit(False, str(e), {})
-    
-    def find_desktop_files(self):
-        desktop_files = []
-        for root, dirs, files in os.walk(self.temp_dir):
-            for file in files:
-                if file.endswith('.desktop'):
-                    desktop_files.append(os.path.join(root, file))
-        return desktop_files
-    
-    def find_binaries(self):
-        binaries = []
-        for root, dirs, files in os.walk(self.temp_dir):
-            for file in files:
-                filepath = os.path.join(root, file)
-                if os.access(filepath, os.X_OK):
-                    with open(filepath, 'rb') as f:
-                        magic = f.read(4)
-                        if magic.startswith(b'#!') or magic.startswith(b'\x7fELF'):
-                            binaries.append(filepath)
-        return binaries
-    
-    def find_icons(self):
-        icons = []
-        icon_extensions = ['.png', '.svg', '.xpm', '.ico']
-        for root, dirs, files in os.walk(self.temp_dir):
-            for file in files:
-                if any(file.lower().endswith(ext) for ext in icon_extensions):
-                    if 'icon' in file.lower() or 'icons' in root.lower():
-                        icons.append(os.path.join(root, file))
-        return icons
-    
-    def identify_main_binary(self, binaries, desktop_files):
-        if not binaries:
-            return None
-        
-        # Check desktop file first
-        if desktop_files:
-            desktop_info = self.parse_desktop_file(desktop_files[0])
-            exec_cmd = desktop_info.get('exec', '')
-            if exec_cmd:
-                exec_binary = exec_cmd.split()[0] if ' ' in exec_cmd else exec_cmd
-                exec_binary = os.path.basename(exec_binary)
-                for binary in binaries:
-                    if os.path.basename(binary) == exec_binary:
-                        return binary
-        
-        # Simple scoring - prefer binaries in bin directories
-        scored_binaries = []
-        for binary in binaries:
-            score = 0
-            bin_name = os.path.basename(binary)
-            
-            if 'bin' in binary:
-                score += 10
-            
-            if '.' not in bin_name:
-                score += 5
-            elif bin_name.endswith(('.sh', '.py', '.pl')):
-                score += 3
-            
-            # Common patterns
-            main_patterns = ['app', 'main', 'run', 'start']
-            if any(pattern in bin_name.lower() for pattern in main_patterns):
-                score += 8
-            
-            # Avoid clear uninstallers if we have alternatives
-            if 'uninstall' in bin_name.lower() or 'remove' in bin_name.lower():
-                score -= 5
-            
-            scored_binaries.append((binary, score))
-        
-        scored_binaries.sort(key=lambda x: x[1], reverse=True)
-        return scored_binaries[0][0] if scored_binaries else binaries[0]
-    
-    def parse_desktop_file(self, desktop_path):
-        config = configparser.ConfigParser()
-        try:
-            config.read(desktop_path)
-            if 'Desktop Entry' in config:
-                return {
-                    'name': config['Desktop Entry'].get('Name', 'Unknown'),
-                    'comment': config['Desktop Entry'].get('Comment', ''),
-                    'exec': config['Desktop Entry'].get('Exec', ''),
-                    'icon': config['Desktop Entry'].get('Icon', ''),
-                    'categories': config['Desktop Entry'].get('Categories', '').split(';'),
-                    'version': config['Desktop Entry'].get('Version', '1.0')
-                }
-        except:
-            pass
-        return {}
-    
-    def create_marker_file(self, directory, app_info):
-        marker_data = {
-            'installed_by': 'Tarball Installer',
-            'installer_version': '0.13.0',
-            'app_id': self.installation_data['app_id'],
-            'app_name': app_info.get('name', os.path.basename(self.tarball_path)),
-            'app_version': app_info.get('version', '1.0'),
-            'install_time': datetime.now().isoformat(),
-            'install_type': self.options.get('install_type', 'user'),
-            'tarball_source': os.path.basename(self.tarball_path)
-        }
-        
-        marker_path = directory / '.tarball-installer-marker.json'
-        with open(marker_path, 'w') as f:
-            json.dump(marker_data, f, indent=2)
-        
-        return str(marker_path)
-    
-    def install_to_user(self, desktop_files, binaries, icons, main_binary):
-        home = Path.home()
-        local_bin = home / '.local' / 'bin'
-        local_apps = home / '.local' / 'share' / 'applications'
-        local_icons = home / '.local' / 'share' / 'icons'
-        
-        local_bin.mkdir(parents=True, exist_ok=True)
-        local_apps.mkdir(parents=True, exist_ok=True)
-        local_icons.mkdir(parents=True, exist_ok=True)
-        
-        install_data = {
-            'install_path': str(local_bin),
-            'desktop_path': str(local_apps),
-            'installed_files': [],
-            'marker_files': []
-        }
-        
-        # Get app info
-        app_info = {}
-        if desktop_files:
-            app_info = self.parse_desktop_file(desktop_files[0])
-            if app_info.get('name'):
-                self.installation_data['app_name'] = app_info['name']
-                self.installation_data['app_version'] = app_info.get('version', '1.0')
-        else:
-            # Create app name from filename
-            app_name = os.path.basename(self.tarball_path)
-            app_name = re.sub(r'\.(tar\.gz|tar\.bz2|tar\.xz|tgz|tbz2|txz)$', '', app_name)
-            app_name = re.sub(r'[-_]', ' ', app_name).title()
-            self.installation_data['app_name'] = app_name
-            self.installation_data['app_version'] = '1.0'
-            
-            # Create desktop file
-            if main_binary:
-                desktop_content = f"""[Desktop Entry]
-Name={app_name}
-Exec={os.path.basename(main_binary)}
-Type=Application
-Categories=Utility;
-Comment=Installed via Tarball Installer
-"""
-                desktop_path = Path(self.temp_dir) / f"{app_name.lower().replace(' ', '-')}.desktop"
-                desktop_path.write_text(desktop_content)
-                desktop_files = [str(desktop_path)]
-                app_info = {'name': app_name, 'version': '1.0'}
-        
-        # Create marker file
-        marker_path = self.create_marker_file(local_bin, app_info)
-        install_data['marker_files'].append(marker_path)
-        self.log.emit(f"Created marker file: {marker_path}")
-        
-        # Install binaries
-        for binary in binaries:
-            dest = local_bin / os.path.basename(binary)
-            shutil.copy2(binary, dest)
-            dest.chmod(0o755)
-            install_data['installed_files'].append(str(dest))
-        
-        # Fix desktop file paths for installed binaries
-        for desktop in desktop_files:
-            desktop_content = Path(desktop).read_text()
-            # Replace relative paths with absolute paths to installed location
-            desktop_content = desktop_content.replace('./', '')
-            desktop_content = desktop_content.replace('Exec=', f'Exec={local_bin}/')
-            
-            dest = local_apps / os.path.basename(desktop)
-            dest.write_text(desktop_content)
-            install_data['installed_files'].append(str(dest))
-            self.log.emit(f"Installed desktop entry: {dest}")
-        
-        # Install icons
-        for icon in icons:
-            dest_dir = local_icons / 'hicolor' / 'scalable' / 'apps'
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            dest = dest_dir / os.path.basename(icon)
-            shutil.copy2(icon, dest)
-            install_data['installed_files'].append(str(dest))
-        
-        # Update desktop database
-        try:
-            subprocess.run(['update-desktop-database', str(local_apps)], check=True)
-            self.log.emit("Updated desktop database")
-        except subprocess.CalledProcessError as e:
-            self.log.emit(f"Warning: Failed to update desktop database: {e}")
-        
-        return install_data
 
 class UninstallThread(QThread):
     progress = Signal(str, int)
@@ -471,8 +245,6 @@ class UninstallThread(QThread):
             self.finished.emit(False, str(e))
 
 class InstallationTracker:
-    """Track installed applications"""
-    
     def __init__(self):
         self.db_path = Path.home() / '.local' / 'share' / 'tarball-installer' / 'installations.json'
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -525,7 +297,6 @@ class InstallationTracker:
             home / 'bin'
         ]
         
-        found_markers = []
         for scan_path in scan_paths:
             if scan_path.exists():
                 for marker_file in scan_path.rglob('.tarball-installer-marker.json'):
@@ -546,14 +317,14 @@ class InstallationTracker:
                                 'source_filename': marker_data.get('tarball_source', ''),
                                 'discovered': True,
                                 'marker_file': str(marker_file),
-                                'installed_files': []
+                                'installed_files': [],
+                                'installer_version': marker_data.get('installer_version', __version__)
                             }
                             self.installations.append(installation_data)
-                            found_markers.append(marker_data.get('app_name', 'Unknown'))
                     except:
                         pass
         
-        if found_markers:
+        if self.installations:
             self.save_installations()
     
     def cleanup_orphaned_markers(self):
@@ -656,7 +427,7 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(QIcon.fromTheme("application-x-tar"))
         
     def setup_ui(self):
-        self.setWindowTitle("Tarball Installer")
+        self.setWindowTitle(f"Tarball Installer v{__version__}")
         self.setGeometry(100, 100, 900, 650)
         
         central_widget = QWidget()
@@ -672,7 +443,7 @@ class MainWindow(QMainWindow):
         header_layout = QVBoxLayout(header_widget)
         header_layout.setContentsMargins(0, 0, 0, 8)
         
-        title = QLabel("Tarball Installer")
+        title = QLabel(f"Tarball Installer v{__version__}")
         title.setObjectName("title")
         subtitle = QLabel("Install and manage applications from tarball archives")
         subtitle.setObjectName("subtitle")
@@ -765,21 +536,20 @@ class MainWindow(QMainWindow):
         file_group.setLayout(file_layout)
         left_layout.addWidget(file_group)
         
-        # Binary selection
-        self.binary_selection_group = QGroupBox("Executable Selection")
+        # Manual binary selection - ALWAYS VISIBLE NOW
+        self.binary_selection_group = QGroupBox("Manual Binary Selection")
         binary_layout = QVBoxLayout()
         
-        self.binary_label = QLabel("Automatic selection will be used")
+        self.binary_label = QLabel("If automatic detection fails or you prefer a different executable, select it manually:")
         self.binary_label.setWordWrap(True)
-        self.binary_label.setStyleSheet("padding: 8px; background-color: #eff0f1; border-radius: 4px; min-height: 40px;")
         
         binary_button_layout = QHBoxLayout()
-        self.select_binary_btn = QPushButton("Select Manually...")
+        self.select_binary_btn = QPushButton("Select Executable...")
         self.select_binary_btn.clicked.connect(self.select_binary_manually)
         self.select_binary_btn.setEnabled(False)
         self.select_binary_btn.setObjectName("secondary")
         
-        self.clear_selection_btn = QPushButton("Clear Selection")
+        self.clear_selection_btn = QPushButton("Clear")
         self.clear_selection_btn.clicked.connect(self.clear_binary_selection)
         self.clear_selection_btn.setEnabled(False)
         self.clear_selection_btn.setObjectName("secondary")
@@ -788,10 +558,14 @@ class MainWindow(QMainWindow):
         binary_button_layout.addWidget(self.clear_selection_btn)
         binary_button_layout.addStretch()
         
+        self.selected_binary_label = QLabel("")
+        self.selected_binary_label.setStyleSheet("padding: 4px; color: #1c71d8;")
+        
         binary_layout.addWidget(self.binary_label)
         binary_layout.addLayout(binary_button_layout)
+        binary_layout.addWidget(self.selected_binary_label)
         self.binary_selection_group.setLayout(binary_layout)
-        self.binary_selection_group.setVisible(False)
+        self.binary_selection_group.setVisible(True)  # Always visible now
         left_layout.addWidget(self.binary_selection_group)
         
         self.stats_label = QLabel("")
@@ -929,33 +703,37 @@ class MainWindow(QMainWindow):
         help_group = QGroupBox("Help & Information")
         help_layout = QVBoxLayout()
         
-        help_text = QLabel("""
+        help_text = QLabel(f"""
         <div style='line-height: 1.6;'>
-        <h3>Tarball Installer v0.13.0</h3>
+        <h3>Tarball Installer v{__version__}</h3>
         
         <h4>Quick Start:</h4>
         <ol>
         <li>Go to <b>Install</b> tab and click <b>Browse for Tarball</b></li>
         <li>Select your downloaded .tar.gz, .tar.bz2, or .tar.xz file</li>
-        <li>Click <b>Analyze Package</b> to see detailed contents in the sidebar</li>
-        <li>If automatic detection fails, use <b>Select Manually</b> to choose the main executable</li>
+        <li>Click <b>Analyze Package</b> to see detailed contents</li>
+        <li>If no .desktop file exists, you can manually select the main executable</li>
         <li>Choose installation options</li>
         <li>Click <b>Install Application</b></li>
         </ol>
         
         <h4>Key Features:</h4>
         <ul>
-        <li><b>Manual Binary Selection:</b> Override automatic detection when needed</li>
-        <li><b>Smart Analysis:</b> Preview tarball contents with visual indicators</li>
+        <li><b>Manual Binary Selection:</b> Use file picker to select main executable when needed</li>
+        <li><b>Smart Analysis:</b> Shows all executables (with or without extensions)</li>
         <li><b>System Integration:</b> Creates proper desktop entries</li>
         <li><b>Mandatory Tracking:</b> Always creates marker files for uninstallation</li>
         <li><b>Complete Uninstallation:</b> Removes all files and markers</li>
         <li><b>Auto-detection:</b> Finds existing installations on startup</li>
         </ul>
         
-        <h4>For Complex Applications (like Blender):</h4>
-        <p>Some applications have complex launch scripts or wrappers. If automatic selection
-        doesn't work, use the <b>Select Manually</b> button to choose the correct executable.</p>
+        <h4>Manual Binary Selection:</h4>
+        <p>If a package doesn't have a .desktop file, you'll need to manually select
+        the main executable. Since you've already tested the app from the extracted
+        tarball, you should know which file to run.</p>
+        
+        <p>Click <b>Select Executable</b> and navigate to the extracted folder to
+        choose the correct binary.</p>
         
         <h4>Marker Files:</h4>
         <p>Marker files (<code>.tarball-installer-marker.json</code>) are always created
@@ -1015,120 +793,215 @@ class MainWindow(QMainWindow):
             self.file_label.setText(f"📦 <b>{file_name}</b><br>Size: {file_size:.2f} MB")
             self.analyze_btn.setEnabled(True)
             self.install_btn.setEnabled(True)
+            self.select_binary_btn.setEnabled(True)  # Enable manual selection
             self.status_bar.showMessage(f"Selected: {file_name}")
             
     def analyze_package(self):
         if not self.current_file:
             return
-            
+        
+        # Clean up any previous temp directories (in case user selected a different file)
+        self.cleanup_temp_dirs()
+        
         try:
             self.contents_table.setRowCount(0)
             self.detected_binaries = []
+            self.user_selected_binary = None
+            self.selected_binary_label.setText("")
+            
+            # Extract to temp directory for analysis AND future installation
+            self.temp_analysis_dir = tempfile.mkdtemp(prefix="tarball_install_")
+            
+            file_name = os.path.basename(self.current_file)
+            file_size = os.path.getsize(self.current_file) / (1024 * 1024)
+            
+            # Show extraction progress in the UI
+            self.analysis_info_label.setText(f"📦 <b>{file_name}</b><br>Size: {file_size:.2f} MB<br>Extracting for analysis...")
+            self.status_bar.showMessage("Extracting package for analysis...")
             
             with tarfile.open(self.current_file, 'r:*') as tar:
                 members = tar.getmembers()
+                total_members = len(members)
                 
-                file_name = os.path.basename(self.current_file)
-                file_size = os.path.getsize(self.current_file) / (1024 * 1024)
-                self.analysis_info_label.setText(f"📦 <b>{file_name}</b><br>Size: {file_size:.2f} MB<br>Total items: {len(members)}")
+                # Update the file count as we extract
+                self.analysis_info_label.setText(f"📦 <b>{file_name}</b><br>Size: {file_size:.2f} MB<br>Extracting {total_members} items...")
                 
-                # Find binaries
-                for m in members:
-                    if not m.isdir() and ('/bin/' in m.name or m.name.endswith(('.sh', '.bin', '.run', '.py', '.pl'))):
-                        self.detected_binaries.append(m.name)
+                # Extract all files - this is necessary for both analysis AND installation
+                for i, member in enumerate(members):
+                    tar.extract(member, self.temp_analysis_dir)
+                    if i % 100 == 0:  # Update progress every 100 files
+                        progress = int((i / total_members) * 100)
+                        self.status_bar.showMessage(f"Extracting: {progress}%")
+            
+            # Now analyze the extracted contents
+            self.status_bar.showMessage("Analyzing extracted package...")
+            
+            # Find executables using the same logic as InstallerThread
+            binaries = []
+            for root, dirs, files in os.walk(self.temp_analysis_dir):
+                for file in files:
+                    filepath = os.path.join(root, file)
+                    if os.access(filepath, os.X_OK):
+                        try:
+                            with open(filepath, 'rb') as f:
+                                magic = f.read(4)
+                                if magic.startswith(b'#!') or magic.startswith(b'\x7fELF'):
+                                    binaries.append(filepath)
+                                elif '.' not in file and os.path.getsize(filepath) > 100:
+                                    with open(filepath, 'rb') as f2:
+                                        sample = f2.read(1024)
+                                        if any(b > 127 for b in sample):
+                                            binaries.append(filepath)
+                        except:
+                            pass
+            
+            self.detected_binaries = binaries
+            
+            desktop_files = []
+            icons = []
+            for root, dirs, files in os.walk(self.temp_analysis_dir):
+                for file in files:
+                    if file.endswith('.desktop'):
+                        desktop_files.append(os.path.join(root, file))
+                    if any(file.lower().endswith(ext) for ext in ['.png', '.svg', '.xpm', '.ico']):
+                        if 'icon' in file.lower() or 'icons' in root.lower():
+                            icons.append(os.path.join(root, file))
+            
+            # ALWAYS show manual selection section, but update text based on findings
+            if not desktop_files and binaries:
+                self.binary_label.setText("No .desktop file found. Please select the main executable manually.")
+            elif desktop_files and binaries:
+                self.binary_label.setText("Auto-detection found a .desktop file, but you can override the main executable manually if needed:")
+            else:
+                self.binary_label.setText("Select the main executable manually:")
+            
+            self.stats_label.setText(f"📊 Found: {len(desktop_files)} desktop entries, {len(binaries)} executables, {len(icons)} icons")
+            
+            # Display first 100 items
+            display_items = []
+            for root, dirs, files in os.walk(self.temp_analysis_dir):
+                for file in files:
+                    display_items.append(os.path.join(root, file))
+                if len(display_items) >= 100:
+                    break
+            
+            self.contents_table.setRowCount(len(display_items[:100]))
+            
+            for row, filepath in enumerate(display_items[:100]):
+                name = os.path.basename(filepath)
                 
-                desktop_files = [m for m in members if m.name.endswith('.desktop')]
-                icons = [m for m in members if m.name.endswith(('.png', '.svg', '.xpm', '.ico'))]
+                # Check file type
+                is_desktop = filepath in desktop_files
+                is_binary = filepath in binaries
+                is_icon = filepath in icons
                 
-                # Show binary selection if multiple found
-                if len(self.detected_binaries) > 1:
-                    self.binary_selection_group.setVisible(True)
-                    self.select_binary_btn.setEnabled(True)
-                    self.binary_label.setText(f"Multiple executables detected ({len(self.detected_binaries)} found).\nAutomatic selection will be used, or select manually.")
+                if is_desktop:
+                    display_name = f"📄 {name}"
+                elif is_binary:
+                    display_name = f"⚙️ {name}"
+                elif is_icon:
+                    display_name = f"🎨 {name}"
                 else:
-                    self.binary_selection_group.setVisible(False)
-                    self.user_selected_binary = None
+                    display_name = name
                 
-                self.stats_label.setText(f"📊 Found: {len(desktop_files)} desktop entries, {len(self.detected_binaries)} binaries, {len(icons)} icons")
+                name_item = QTableWidgetItem(display_name)
                 
-                # Display contents
-                display_members = members[:100] if len(members) > 100 else members
-                self.contents_table.setRowCount(len(display_members))
+                if os.path.isdir(filepath):
+                    type_item = QTableWidgetItem("📁 Directory")
+                elif os.path.isfile(filepath):
+                    type_item = QTableWidgetItem("📄 File")
+                elif os.path.islink(filepath):
+                    type_item = QTableWidgetItem("🔗 Symlink")
+                else:
+                    type_item = QTableWidgetItem("❓ Other")
                 
-                for row, member in enumerate(display_members):
-                    name = os.path.basename(member.name)
-                    if member.name.endswith('.desktop'):
-                        display_name = f"📄 {name}"
-                    elif member.name in self.detected_binaries:
-                        display_name = f"⚙️ {name}"
-                    elif member.name.endswith(('.png', '.svg', '.ico')):
-                        display_name = f"🎨 {name}"
-                    else:
-                        display_name = name
-                    
-                    name_item = QTableWidgetItem(display_name)
-                    
-                    if member.isdir():
-                        type_item = QTableWidgetItem("📁 Directory")
-                    elif member.isfile():
-                        type_item = QTableWidgetItem("📄 File")
-                    elif member.issym():
-                        type_item = QTableWidgetItem("🔗 Symlink")
-                    else:
-                        type_item = QTableWidgetItem("❓ Other")
-                    
-                    if member.isfile():
-                        size_kb = member.size / 1024
-                        size_text = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb/1024:.1f} MB"
-                        size_item = QTableWidgetItem(size_text)
-                    else:
-                        size_item = QTableWidgetItem("")
-                    
-                    self.contents_table.setItem(row, 0, name_item)
-                    self.contents_table.setItem(row, 1, type_item)
-                    self.contents_table.setItem(row, 2, size_item)
+                if os.path.isfile(filepath):
+                    size_kb = os.path.getsize(filepath) / 1024
+                    size_text = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb/1024:.1f} MB"
+                    size_item = QTableWidgetItem(size_text)
+                else:
+                    size_item = QTableWidgetItem("")
                 
-                self.contents_table.resizeColumnsToContents()
-                self.status_bar.showMessage(f"Analyzed: {len(members)} items found")
-                
+                self.contents_table.setItem(row, 0, name_item)
+                self.contents_table.setItem(row, 1, type_item)
+                self.contents_table.setItem(row, 2, size_item)
+            
+            self.contents_table.resizeColumnsToContents()
+            self.analysis_info_label.setText(f"📦 <b>{file_name}</b><br>Size: {file_size:.2f} MB<br>Total items: {len(members)}")
+            self.status_bar.showMessage(f"Analyzed: {len(members)} items, {len(binaries)} executables")
+            
         except Exception as e:
+            # Clean up on error
+            self.cleanup_temp_dirs()
             QMessageBox.warning(self, "Analysis Error", f"Could not analyze package:\n{str(e)}")
     
     def select_binary_manually(self):
-        if not self.detected_binaries:
+        """Simple file picker for manual binary selection - REUSES existing extraction"""
+        if not hasattr(self, 'temp_analysis_dir') or not self.temp_analysis_dir or not os.path.exists(self.temp_analysis_dir):
+            QMessageBox.warning(self, "No Analysis Data", "Please analyze the package first before selecting a binary.")
             return
         
-        # Extract actual binary paths from tarball
-        temp_dir = tempfile.mkdtemp(prefix="tarball_analyze_")
-        try:
-            with tarfile.open(self.current_file, 'r:*') as tar:
-                # Extract only binaries for the dialog
-                binary_paths = []
-                for member in tar.getmembers():
-                    if member.name in self.detected_binaries:
-                        tar.extract(member, temp_dir)
-                        binary_paths.append(os.path.join(temp_dir, member.name))
-            
-            if binary_paths:
-                dialog = BinarySelectionDialog(binary_paths, self)
-                if dialog.exec() and dialog.selected_binary:
-                    self.user_selected_binary = dialog.selected_binary
-                    bin_name = os.path.basename(self.user_selected_binary)
-                    self.binary_label.setText(f"✅ Manual selection: <b>{bin_name}</b>")
-                    self.clear_selection_btn.setEnabled(True)
-        finally:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
+        # Use the already-extracted directory from analysis
+        extracted_root = self.find_extraction_root(self.temp_analysis_dir)
+        binary_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Main Executable",
+            extracted_root,
+            "Executable files (*);;All files (*.*)"
+        )
+        
+        if binary_path and os.path.exists(binary_path):
+            # Make it relative to the extraction root
+            try:
+                rel_path = os.path.relpath(binary_path, extracted_root)
+                self.user_selected_binary = rel_path
+                self.selected_binary_label.setText(f"Selected: {os.path.basename(binary_path)}")
+                self.clear_selection_btn.setEnabled(True)
+            except ValueError as e:
+                QMessageBox.warning(self, "Selection Error", f"Could not determine relative path: {str(e)}")
+
+    def find_extraction_root(self, temp_dir):
+        """Find the actual root directory where tarball contents were extracted"""
+        # List contents of temp_dir
+        items = os.listdir(temp_dir)
+        
+        # If there's only one item and it's a directory, that's likely the root
+        if len(items) == 1 and os.path.isdir(os.path.join(temp_dir, items[0])):
+            return os.path.join(temp_dir, items[0])
+        
+        # Otherwise, return the temp_dir itself
+        return temp_dir
     
+    def cleanup_temp_dirs(self):
+        """Clean up temporary directories"""
+        if hasattr(self, 'temp_analysis_dir') and self.temp_analysis_dir:
+            if os.path.exists(self.temp_analysis_dir):
+                try:
+                    shutil.rmtree(self.temp_analysis_dir)
+                except:
+                    pass
+            self.temp_analysis_dir = None
+
     def clear_binary_selection(self):
         self.user_selected_binary = None
-        self.binary_label.setText("Automatic selection will be used")
+        self.selected_binary_label.setText("")
         self.clear_selection_btn.setEnabled(False)
     
     def start_installation(self):
         if not self.current_file:
             QMessageBox.warning(self, "No Package Selected", "Please select a tarball file first.")
             return
+        
+        # If we don't have an extracted directory yet, we need to extract first
+        if not hasattr(self, 'temp_analysis_dir') or not self.temp_analysis_dir:
+            QMessageBox.warning(self, "Package Not Analyzed", "Please analyze the package first before installing.")
+            return
+        
+        selected_binary_for_installer = None
+        if self.user_selected_binary:
+            # Convert relative path to absolute path in the extracted directory
+            extracted_root = self.find_extraction_root(self.temp_analysis_dir)
+            selected_binary_for_installer = os.path.join(extracted_root, self.user_selected_binary)
         
         self.progress_group.setVisible(True)
         self.progress_bar.setValue(0)
@@ -1145,7 +1018,8 @@ class MainWindow(QMainWindow):
         self.installer_thread = InstallerThread(
             self.current_file,
             options,
-            self.user_selected_binary
+            selected_binary_for_installer,
+            self.temp_analysis_dir  # Pass the already-extracted directory
         )
         self.installer_thread.progress.connect(self.update_progress)
         self.installer_thread.log.connect(self.update_log)
@@ -1185,6 +1059,9 @@ class MainWindow(QMainWindow):
             self.update_log(f"✗ Error: {message}")
             QMessageBox.critical(self, "Installation Failed", f"Installation failed:\n{message}")
             self.status_bar.showMessage("Installation failed")
+        
+        # Clean up temp directory after installation (success or failure)
+        self.cleanup_temp_dirs()
         
         self.install_btn.setEnabled(True)
         self.cancel_btn.setVisible(False)
@@ -1311,14 +1188,14 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("Refreshed application list")
         
     def show_about_dialog(self):
-        about_text = """
-        <h3>Tarball Installer v0.13.0</h3>
+        about_text = f"""
+        <h3>Tarball Installer v{__version__}</h3>
         <p>A graphical tool for installing software from tarball archives.</p>
         
         <p><b>Key Features:</b></p>
         <ul>
-        <li>Manual binary selection for complex applications</li>
-        <li>Smart package analysis with sidebar preview</li>
+        <li>Manual binary selection via system file picker</li>
+        <li>Smart package analysis showing all executables</li>
         <li>System integration (desktop entries, icons)</li>
         <li>Mandatory marker files for installation tracking</li>
         <li>Complete uninstallation with file removal</li>
@@ -1332,3 +1209,8 @@ class MainWindow(QMainWindow):
         """
         
         QMessageBox.about(self, "About Tarball Installer", about_text)
+
+    def closeEvent(self, event):
+        """Clean up when window closes"""
+        self.cleanup_temp_dirs()
+        event.accept()        
