@@ -6,7 +6,8 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                               QSizePolicy, QSpacerItem, QSplitter, QToolBar,
                               QStatusBar, QMenu, QMenuBar, QDialog, QDialogButtonBox,
                               QRadioButton, QButtonGroup, QTreeWidget, QTreeWidgetItem,
-                              QHeaderView, QScrollArea, QListWidget)
+                              QHeaderView, QScrollArea, QListWidget, QTableWidget,
+                              QTableWidgetItem, QAbstractItemView, QGridLayout)
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QTimer, QPropertyAnimation, QEasingCurve, QFile, QTextStream
 from PySide6.QtGui import QFont, QIcon, QPalette, QColor, QPainter, QLinearGradient, QAction, QFontDatabase
 import subprocess
@@ -112,14 +113,18 @@ class InstallerThread(QThread):
         
     def run(self):
         try:
+            # Generate unique app ID
+            file_hash = hashlib.md5(self.tarball_path.encode()).hexdigest()[:12]
             self.installation_data = {
-                'app_id': f"user_{hashlib.md5(self.tarball_path.encode()).hexdigest()[:8]}",
+                'app_id': f"tarball_installer_{file_hash}",
                 'source_file': self.tarball_path,
+                'source_filename': os.path.basename(self.tarball_path),
                 'install_time': datetime.now().isoformat(),
                 'install_type': self.options.get('install_type', 'user'),
                 'files_installed': [],
                 'desktop_entries': [],
-                'binaries': []
+                'binaries': [],
+                'marker_files': []  # Track marker files we create
             }
             
             self.log.emit(f"Starting installation of {os.path.basename(self.tarball_path)}")
@@ -218,11 +223,31 @@ class InstallerThread(QThread):
                     'comment': config['Desktop Entry'].get('Comment', ''),
                     'exec': config['Desktop Entry'].get('Exec', ''),
                     'icon': config['Desktop Entry'].get('Icon', ''),
-                    'categories': config['Desktop Entry'].get('Categories', '').split(';')
+                    'categories': config['Desktop Entry'].get('Categories', '').split(';'),
+                    'version': config['Desktop Entry'].get('Version', '1.0')
                 }
         except:
             pass
         return {}
+    
+    def create_marker_file(self, directory, app_info):
+        """Create a marker file in the installation directory"""
+        marker_data = {
+            'installed_by': 'Tarball Installer',
+            'installer_version': '1.0.0',
+            'app_id': self.installation_data['app_id'],
+            'app_name': app_info.get('name', os.path.basename(self.tarball_path)),
+            'app_version': app_info.get('version', '1.0'),
+            'install_time': datetime.now().isoformat(),
+            'install_type': self.options.get('install_type', 'user'),
+            'tarball_source': os.path.basename(self.tarball_path)
+        }
+        
+        marker_path = directory / '.tarball-installer-marker.json'
+        with open(marker_path, 'w') as f:
+            json.dump(marker_data, f, indent=2)
+        
+        return str(marker_path)
     
     def install_to_user(self, desktop_files, binaries, icons):
         """Install to user's home directory"""
@@ -239,7 +264,8 @@ class InstallerThread(QThread):
         install_data = {
             'install_path': str(local_bin),
             'desktop_path': str(local_apps),
-            'installed_files': []
+            'installed_files': [],
+            'marker_files': []
         }
         
         # Parse first desktop file for app info
@@ -249,6 +275,12 @@ class InstallerThread(QThread):
             if app_info.get('name'):
                 self.installation_data['app_name'] = app_info['name']
                 self.installation_data['app_comment'] = app_info.get('comment', '')
+                self.installation_data['app_version'] = app_info.get('version', '1.0')
+        
+        # Create marker file in bin directory
+        marker_path = self.create_marker_file(local_bin, app_info)
+        install_data['marker_files'].append(marker_path)
+        self.log.emit(f"Created marker file: {marker_path}")
         
         # Install binaries
         for binary in binaries:
@@ -283,13 +315,80 @@ class InstallerThread(QThread):
         
         return install_data
 
+class UninstallThread(QThread):
+    """Thread for uninstalling applications"""
+    progress = Signal(str, int)
+    log = Signal(str)
+    finished = Signal(bool, str)
+    
+    def __init__(self, installation_data):
+        super().__init__()
+        self.installation_data = installation_data
+        
+    def run(self):
+        try:
+            self.log.emit(f"Starting uninstallation of {self.installation_data.get('app_name', 'Unknown')}")
+            self.progress.emit("Preparing uninstallation...", 10)
+            
+            # Get installation paths
+            installed_files = self.installation_data.get('installed_files', [])
+            marker_files = self.installation_data.get('marker_files', [])
+            
+            # Remove installed files
+            removed_count = 0
+            total_files = len(installed_files) + len(marker_files)
+            
+            for i, file_path in enumerate(installed_files):
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        self.log.emit(f"Removed: {os.path.basename(file_path)}")
+                        removed_count += 1
+                    except Exception as e:
+                        self.log.emit(f"Warning: Could not remove {file_path}: {e}")
+                
+                progress = 10 + int((i / total_files) * 70)
+                self.progress.emit("Removing files...", progress)
+            
+            # Remove marker files
+            for i, marker_path in enumerate(marker_files):
+                if os.path.exists(marker_path):
+                    try:
+                        os.remove(marker_path)
+                        self.log.emit(f"Removed marker: {os.path.basename(marker_path)}")
+                        removed_count += 1
+                    except:
+                        pass
+                
+                progress = 80 + int((i / len(marker_files)) * 10)
+                self.progress.emit("Cleaning up...", progress)
+            
+            # Update desktop database if desktop files were removed
+            if any('.desktop' in f for f in installed_files):
+                try:
+                    home = Path.home()
+                    local_apps = home / '.local' / 'share' / 'applications'
+                    subprocess.run(['update-desktop-database', str(local_apps)], check=True)
+                    self.log.emit("Updated desktop database")
+                except:
+                    self.log.emit("Warning: Could not update desktop database")
+            
+            self.progress.emit("Uninstallation complete!", 100)
+            self.finished.emit(True, f"Successfully removed {removed_count} files")
+            
+        except Exception as e:
+            self.log.emit(f"Error during uninstallation: {str(e)}")
+            self.finished.emit(False, str(e))
+
 class InstallationTracker:
-    """Track installed applications"""
+    """Track installed applications and scan for existing installations"""
     
     def __init__(self):
         self.db_path = Path.home() / '.local' / 'share' / 'tarball-installer' / 'installations.json'
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.installations = self.load_installations()
+        # Auto-scan for existing installations
+        self.scan_existing_installations()
     
     def load_installations(self):
         """Load installation database"""
@@ -308,6 +407,14 @@ class InstallationTracker:
     
     def add_installation(self, data):
         """Add a new installation to database"""
+        # Check if already exists
+        for inst in self.installations:
+            if inst.get('app_id') == data.get('app_id'):
+                # Update existing
+                inst.update(data)
+                self.save_installations()
+                return
+        
         self.installations.append(data)
         self.save_installations()
     
@@ -319,15 +426,85 @@ class InstallationTracker:
     def get_installations(self):
         """Get all installations"""
         return self.installations
+    
+    def get_installation_by_id(self, app_id):
+        """Get installation data by app_id"""
+        for inst in self.installations:
+            if inst.get('app_id') == app_id:
+                return inst
+        return None
+    
+    def scan_existing_installations(self):
+        """Scan for marker files to detect existing installations"""
+        home = Path.home()
+        
+        # Scan user directories
+        scan_paths = [
+            home / '.local' / 'bin',
+            home / '.local' / 'share' / 'applications',
+            home / '.local' / 'share' / 'icons',
+            home / 'Applications',  # Common user apps directory
+            home / 'bin'  # User bin directory
+        ]
+        
+        found_markers = []
+        for scan_path in scan_paths:
+            if scan_path.exists():
+                for marker_file in scan_path.rglob('.tarball-installer-marker.json'):
+                    try:
+                        with open(marker_file, 'r') as f:
+                            marker_data = json.load(f)
+                        
+                        # Check if already in database
+                        app_id = marker_data.get('app_id')
+                        already_tracked = any(inst.get('app_id') == app_id for inst in self.installations)
+                        
+                        if not already_tracked:
+                            # Try to find installed files near the marker
+                            installed_files = []
+                            marker_dir = marker_file.parent
+                            
+                            # Look for desktop files in applications directory
+                            apps_dir = home / '.local' / 'share' / 'applications'
+                            if apps_dir.exists():
+                                for desktop_file in apps_dir.glob('*.desktop'):
+                                    installed_files.append(str(desktop_file))
+                            
+                            # Look for binaries in bin directory
+                            bin_dir = home / '.local' / 'bin'
+                            if bin_dir.exists():
+                                for binary in bin_dir.iterdir():
+                                    if binary.is_file() and os.access(binary, os.X_OK):
+                                        installed_files.append(str(binary))
+                            
+                            installation_data = {
+                                'app_id': app_id,
+                                'app_name': marker_data.get('app_name', 'Unknown'),
+                                'app_version': marker_data.get('app_version', '1.0'),
+                                'install_time': marker_data.get('install_time', ''),
+                                'install_type': marker_data.get('install_type', 'user'),
+                                'source_filename': marker_data.get('tarball_source', ''),
+                                'discovered': True,  # Mark as discovered, not installed by current session
+                                'marker_file': str(marker_file),
+                                'installed_files': installed_files
+                            }
+                            self.installations.append(installation_data)
+                            found_markers.append(marker_data.get('app_name', 'Unknown'))
+                    except Exception as e:
+                        print(f"Error reading marker file {marker_file}: {e}")
+        
+        if found_markers:
+            self.save_installations()
+            print(f"Auto-scanned and found {len(found_markers)} existing installations")
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.tracker = InstallationTracker()
+        self.tracker = InstallationTracker()  # Auto-scans on initialization
         self.setup_ui()
         self.setup_style()
         self.current_file = None
-        self.install_history = []
+        self.current_analysis = None
         
         # Show welcome dialog on first run
         self.show_welcome_dialog()
@@ -421,6 +598,15 @@ class MainWindow(QMainWindow):
                 border-color: #93cee9;
             }
             
+            QPushButton#danger {
+                background-color: #da4453;
+                color: white;
+            }
+            
+            QPushButton#danger:hover {
+                background-color: #c03d4a;
+            }
+            
             /* Labels */
             QLabel {
                 color: #232629;
@@ -479,6 +665,29 @@ class MainWindow(QMainWindow):
                 color: white;
             }
             
+            /* Table Widget */
+            QTableWidget {
+                border: 1px solid #c2c7cb;
+                border-radius: 4px;
+                background-color: white;
+                gridline-color: #eff0f1;
+            }
+            
+            QTableWidget::item {
+                padding: 4px;
+            }
+            
+            QTableWidget::item:selected {
+                background-color: #3daee9;
+                color: white;
+            }
+            
+            QHeaderView::section {
+                background-color: #eff0f1;
+                padding: 6px;
+                border: 1px solid #c2c7cb;
+            }
+            
             /* Tab Widget - KDE style */
             QTabWidget::pane {
                 border: 1px solid #c2c7cb;
@@ -510,7 +719,8 @@ class MainWindow(QMainWindow):
         
     def setup_ui(self):
         self.setWindowTitle("Tarball Installer")
-        self.setGeometry(100, 100, 1000, 700)
+        # Make window narrower: 800 width instead of 1000
+        self.setGeometry(100, 100, 850, 700)  # Slightly wider for the analysis tab
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -539,6 +749,7 @@ class MainWindow(QMainWindow):
         # Create tab widget
         self.tab_widget = QTabWidget()
         self.setup_install_tab()
+        self.setup_analyze_tab()  # New analysis tab
         self.setup_manage_tab()
         self.setup_help_tab()
         
@@ -547,7 +758,7 @@ class MainWindow(QMainWindow):
         # Status bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready")
+        self.status_bar.showMessage("Ready - Auto-scanned for existing installations")
         
     def setup_menu_bar(self):
         menubar = self.menuBar()
@@ -559,6 +770,10 @@ class MainWindow(QMainWindow):
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self.browse_file)
         file_menu.addAction(open_action)
+        
+        scan_action = QAction("&Scan for Existing Installations", self)
+        scan_action.triggered.connect(self.scan_installations)
+        file_menu.addAction(scan_action)
         
         file_menu.addSeparator()
         
@@ -581,6 +796,10 @@ class MainWindow(QMainWindow):
         refresh_action.triggered.connect(self.refresh_apps_list)
         tools_menu.addAction(refresh_action)
         
+        cleanup_action = QAction("&Cleanup Orphaned Markers", self)
+        cleanup_action.triggered.connect(self.cleanup_markers)
+        tools_menu.addAction(cleanup_action)
+        
         # Help menu
         help_menu = menubar.addMenu("&Help")
         
@@ -589,6 +808,7 @@ class MainWindow(QMainWindow):
         help_menu.addAction(about_action)
         
     def setup_install_tab(self):
+        """Setup the installation tab (simplified)"""
         install_tab = QWidget()
         layout = QVBoxLayout(install_tab)
         layout.setSpacing(12)
@@ -624,20 +844,10 @@ class MainWindow(QMainWindow):
         file_group.setLayout(file_layout)
         layout.addWidget(file_group)
         
-        # Package analysis results
-        self.analysis_group = QGroupBox("Package Analysis")
-        analysis_layout = QVBoxLayout()
-        
-        # Tree widget for showing package contents
-        self.contents_tree = QTreeWidget()
-        self.contents_tree.setHeaderLabels(["Name", "Type", "Size"])
-        self.contents_tree.setColumnWidth(0, 300)
-        self.contents_tree.setMaximumHeight(200)
-        
-        analysis_layout.addWidget(self.contents_tree)
-        self.analysis_group.setLayout(analysis_layout)
-        self.analysis_group.setVisible(False)
-        layout.addWidget(self.analysis_group)
+        # Quick stats
+        self.stats_label = QLabel("")
+        self.stats_label.setStyleSheet("color: #5e646b; font-size: 9pt; padding: 4px;")
+        layout.addWidget(self.stats_label)
         
         # Installation options
         options_group = QGroupBox("Installation Options")
@@ -647,7 +857,7 @@ class MainWindow(QMainWindow):
         install_type_layout = QHBoxLayout()
         install_type_layout.addWidget(QLabel("Install for:"))
         
-        self.user_radio = QRadioButton("Current User (Recommended)")
+        self.user_radio = QRadioButton("Current User")
         self.user_radio.setChecked(True)
         
         self.system_radio = QRadioButton("All Users (Requires root)")
@@ -661,19 +871,12 @@ class MainWindow(QMainWindow):
         self.create_desktop_entry = QCheckBox("Create application menu entry")
         self.create_desktop_entry.setChecked(True)
         
-        self.create_launcher = QCheckBox("Add to application launcher")
-        self.create_launcher.setChecked(True)
-        
-        self.update_path = QCheckBox("Add to system PATH")
-        self.update_path.setChecked(True)
-        
-        self.track_installation = QCheckBox("Track installation for easy removal")
-        self.track_installation.setChecked(True)
+        self.leave_marker = QCheckBox("Leave marker file for future detection")
+        self.leave_marker.setChecked(True)
+        self.leave_marker.setToolTip("Creates a .tarball-installer-marker.json file for easy re-detection")
         
         options_layout.addWidget(self.create_desktop_entry)
-        options_layout.addWidget(self.create_launcher)
-        options_layout.addWidget(self.update_path)
-        options_layout.addWidget(self.track_installation)
+        options_layout.addWidget(self.leave_marker)
         options_group.setLayout(options_layout)
         layout.addWidget(options_group)
         
@@ -716,6 +919,47 @@ class MainWindow(QMainWindow):
         
         self.tab_widget.addTab(install_tab, "Install")
         
+    def setup_analyze_tab(self):
+        """Setup the package analysis tab"""
+        analyze_tab = QWidget()
+        layout = QVBoxLayout(analyze_tab)
+        layout.setSpacing(12)
+        
+        # Analysis info
+        info_group = QGroupBox("Package Information")
+        info_layout = QVBoxLayout()
+        
+        self.analysis_info_label = QLabel("No package analyzed yet.\nSelect a package in the Install tab and click 'Analyze Package'.")
+        self.analysis_info_label.setWordWrap(True)
+        self.analysis_info_label.setStyleSheet("""
+            padding: 12px;
+            background-color: #eff0f1;
+            border-radius: 4px;
+            min-height: 60px;
+        """)
+        
+        info_layout.addWidget(self.analysis_info_label)
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+        
+        # Package contents table
+        contents_group = QGroupBox("Package Contents")
+        contents_layout = QVBoxLayout()
+        
+        self.contents_table = QTableWidget()
+        self.contents_table.setColumnCount(4)
+        self.contents_table.setHorizontalHeaderLabels(["Name", "Type", "Size", "Path"])
+        self.contents_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.contents_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.contents_table.horizontalHeader().setStretchLastSection(True)
+        self.contents_table.verticalHeader().setVisible(False)
+        
+        contents_layout.addWidget(self.contents_table)
+        contents_group.setLayout(contents_layout)
+        layout.addWidget(contents_group, 1)  # Take available space
+        
+        self.tab_widget.addTab(analyze_tab, "Analyze")
+        
     def setup_manage_tab(self):
         manage_tab = QWidget()
         layout = QVBoxLayout(manage_tab)
@@ -730,22 +974,34 @@ class MainWindow(QMainWindow):
         refresh_btn.clicked.connect(self.refresh_apps_list)
         refresh_btn.setObjectName("secondary")
         
-        self.remove_btn = QPushButton("Remove Selected")
-        self.remove_btn.clicked.connect(self.remove_application)
-        self.remove_btn.setEnabled(False)
+        scan_btn = QPushButton("Scan for Markers")
+        scan_btn.clicked.connect(self.scan_installations)
+        scan_btn.setObjectName("secondary")
+        
+        self.uninstall_btn = QPushButton("Uninstall Selected")
+        self.uninstall_btn.clicked.connect(self.uninstall_application)
+        self.uninstall_btn.setEnabled(False)
+        self.uninstall_btn.setObjectName("danger")
+        
+        self.remove_tracking_btn = QPushButton("Remove from Tracking")
+        self.remove_tracking_btn.clicked.connect(self.remove_from_tracking)
+        self.remove_tracking_btn.setEnabled(False)
+        self.remove_tracking_btn.setObjectName("secondary")
         
         manage_toolbar.addWidget(refresh_btn)
+        manage_toolbar.addWidget(scan_btn)
         manage_toolbar.addStretch()
-        manage_toolbar.addWidget(self.remove_btn)
+        manage_toolbar.addWidget(self.remove_tracking_btn)
+        manage_toolbar.addWidget(self.uninstall_btn)
         manage_layout.addLayout(manage_toolbar)
         
         # List of installed applications
         self.apps_list = QTreeWidget()
         self.apps_list.setHeaderLabels(["Application", "Version", "Install Date", "Type", "Status"])
-        self.apps_list.setColumnWidth(0, 200)
-        self.apps_list.setColumnWidth(1, 100)
+        self.apps_list.setColumnWidth(0, 180)
+        self.apps_list.setColumnWidth(1, 80)
         self.apps_list.setColumnWidth(2, 120)
-        self.apps_list.setColumnWidth(3, 80)
+        self.apps_list.setColumnWidth(3, 60)
         self.apps_list.itemSelectionChanged.connect(self.on_app_selection_changed)
         
         manage_layout.addWidget(self.apps_list)
@@ -770,33 +1026,33 @@ class MainWindow(QMainWindow):
         
         <h4>Quick Start:</h4>
         <ol>
-        <li>Click <b>Browse for Tarball</b> and select your downloaded .tar.gz, .tar.bz2, or .tar.xz file</li>
-        <li>Click <b>Analyze Package</b> to see what will be installed</li>
+        <li>Go to <b>Install</b> tab and click <b>Browse for Tarball</b></li>
+        <li>Select your downloaded .tar.gz, .tar.bz2, or .tar.xz file</li>
+        <li>Click <b>Analyze Package</b> to see detailed contents in the Analyze tab</li>
         <li>Choose installation options</li>
         <li>Click <b>Install Application</b></li>
         </ol>
         
         <h4>Features:</h4>
         <ul>
-        <li><b>Package Analysis:</b> Preview tarball contents before installation</li>
+        <li><b>Package Analysis:</b> Detailed preview of tarball contents in dedicated tab</li>
         <li><b>System Integration:</b> Creates proper desktop entries and menu items</li>
-        <li><b>Installation Tracking:</b> Keeps track of installed applications for easy removal</li>
-        <li><b>User & System Installation:</b> Install for current user or all users</li>
+        <li><b>Installation Tracking:</b> Keeps track of installed applications</li>
+        <li><b>Marker Files:</b> Leaves marker files for future detection</li>
+        <li><b>Full Uninstallation:</b> Completely remove installed applications</li>
+        <li><b>Auto-detection:</b> Automatically finds existing installations on startup</li>
         </ul>
         
-        <h4>Important Notes:</h4>
+        <h4>Uninstallation:</h4>
+        <p>Two options available in the Manage tab:</p>
         <ul>
-        <li>Most tarballs can be run directly without installation</li>
-        <li>Use this installer for better system integration</li>
-        <li>Tracked installations can be easily removed later</li>
-        <li>System-wide installation requires administrator privileges</li>
+        <li><b>Uninstall Selected:</b> Completely removes the application files and markers</li>
+        <li><b>Remove from Tracking:</b> Only removes from database, keeps files intact</li>
         </ul>
         
-        <h4>Supported Formats:</h4>
-        <p>• .tar.gz (tgz)<br>
-        • .tar.bz2 (tbz2)<br>
-        • .tar.xz (txz)<br>
-        • Standard tar archives (.tar)</p>
+        <h4>Marker Files:</h4>
+        <p>The installer creates <code>.tarball-installer-marker.json</code> files in installation directories.
+        These allow the installer to detect applications it installed previously.</p>
         </div>
         """)
         help_text.setWordWrap(True)
@@ -823,16 +1079,20 @@ class MainWindow(QMainWindow):
             if install_time:
                 try:
                     dt = datetime.fromisoformat(install_time)
-                    install_time = dt.strftime("%Y-%m-%d %H:%M")
+                    install_time = dt.strftime("%Y-%m-%d")
                 except:
                     pass
+            
+            status = '✓ Installed'
+            if install.get('discovered'):
+                status = '🔍 Discovered'
             
             item = QTreeWidgetItem([
                 app_name,
                 install.get('app_version', 'Unknown'),
                 install_time,
                 'User' if install.get('install_type') == 'user' else 'System',
-                '✓ Installed'
+                status
             ])
             item.setData(0, Qt.UserRole, install.get('app_id'))
             self.apps_list.addTopLevelItem(item)
@@ -850,8 +1110,7 @@ class MainWindow(QMainWindow):
             file_name = os.path.basename(file_path)
             file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
             
-            self.file_label.setText(f"📦 <b>{file_name}</b>\n"
-                                   f"Size: {file_size:.2f} MB")
+            self.file_label.setText(f"📦 <b>{file_name}</b><br>Size: {file_size:.2f} MB")
             self.analyze_btn.setEnabled(True)
             self.install_btn.setEnabled(True)
             self.status_bar.showMessage(f"Selected: {file_name}")
@@ -861,49 +1120,71 @@ class MainWindow(QMainWindow):
             return
             
         try:
-            self.contents_tree.clear()
+            # Clear previous analysis
+            self.contents_table.setRowCount(0)
+            self.current_analysis = {}
             
             with tarfile.open(self.current_file, 'r:*') as tar:
-                # Build tree structure
-                root_items = {}
+                members = tar.getmembers()
                 
-                for member in tar.getmembers()[:100]:  # Limit to first 100 for performance
-                    path_parts = member.name.split('/')
+                # Update info label
+                file_name = os.path.basename(self.current_file)
+                file_size = os.path.getsize(self.current_file) / (1024 * 1024)
+                self.analysis_info_label.setText(f"📦 <b>{file_name}</b><br>"
+                                                f"Size: {file_size:.2f} MB<br>"
+                                                f"Total items: {len(members)}")
+                
+                # Count file types
+                desktop_files = [m for m in members if m.name.endswith('.desktop')]
+                binaries = [m for m in members if m.isdir() is False and 
+                          ('/bin/' in m.name or m.name.endswith(('.sh', '.bin', '.run')))]
+                icons = [m for m in members if m.name.endswith(('.png', '.svg', '.xpm', '.ico'))]
+                
+                # Update stats in install tab
+                self.stats_label.setText(f"📊 Found: {len(desktop_files)} desktop entries, "
+                                       f"{len(binaries)} binaries, {len(icons)} icons")
+                
+                # Populate table (limit to 200 items for performance)
+                display_members = members[:200] if len(members) > 200 else members
+                self.contents_table.setRowCount(len(display_members))
+                
+                for row, member in enumerate(display_members):
+                    # Name
+                    name_item = QTableWidgetItem(os.path.basename(member.name))
                     
-                    # Create parent items as needed
-                    parent = None
-                    current_path = ""
+                    # Type
+                    if member.isdir():
+                        type_item = QTableWidgetItem("Directory")
+                    elif member.isfile():
+                        type_item = QTableWidgetItem("File")
+                    elif member.issym():
+                        type_item = QTableWidgetItem("Symbolic Link")
+                    else:
+                        type_item = QTableWidgetItem("Other")
                     
-                    for i, part in enumerate(path_parts):
-                        if not part:  # Skip empty parts
-                            continue
-                            
-                        current_path = current_path + "/" + part if current_path else part
-                        
-                        if current_path not in root_items:
-                            item = QTreeWidgetItem([part])
-                            
-                            if i == len(path_parts) - 1:  # Last part (file)
-                                item.setText(1, "File")
-                                if member.size:
-                                    size_kb = member.size / 1024
-                                    item.setText(2, f"{size_kb:.1f} KB")
-                            else:  # Directory
-                                item.setText(1, "Directory")
-                            
-                            if parent:
-                                parent.addChild(item)
-                            else:
-                                self.contents_tree.addTopLevelItem(item)
-                            
-                            root_items[current_path] = item
-                            parent = item
+                    # Size
+                    if member.isfile():
+                        size_kb = member.size / 1024
+                        if size_kb < 1024:
+                            size_text = f"{size_kb:.1f} KB"
                         else:
-                            parent = root_items[current_path]
+                            size_mb = size_kb / 1024
+                            size_text = f"{size_mb:.1f} MB"
+                        size_item = QTableWidgetItem(size_text)
+                    else:
+                        size_item = QTableWidgetItem("")
+                    
+                    # Path
+                    path_item = QTableWidgetItem(member.name)
+                    
+                    self.contents_table.setItem(row, 0, name_item)
+                    self.contents_table.setItem(row, 1, type_item)
+                    self.contents_table.setItem(row, 2, size_item)
+                    self.contents_table.setItem(row, 3, path_item)
                 
-                # Show package info
-                self.analysis_group.setVisible(True)
-                self.status_bar.showMessage(f"Analyzed: {len(tar.getmembers())} files/folders found")
+                # Switch to analyze tab
+                self.tab_widget.setCurrentIndex(1)  # Analyze tab index
+                self.status_bar.showMessage(f"Analyzed: {len(members)} items found")
                 
         except Exception as e:
             QMessageBox.warning(self, "Analysis Error", 
@@ -929,9 +1210,7 @@ class MainWindow(QMainWindow):
         options = {
             'install_type': install_type,
             'create_desktop_entry': self.create_desktop_entry.isChecked(),
-            'create_launcher': self.create_launcher.isChecked(),
-            'update_path': self.update_path.isChecked(),
-            'track_installation': self.track_installation.isChecked()
+            'leave_marker': self.leave_marker.isChecked()
         }
         
         # Start installation thread
@@ -964,14 +1243,14 @@ class MainWindow(QMainWindow):
         if success:
             self.update_log("✓ Installation completed successfully!")
             
-            # Track installation if requested
-            if self.track_installation.isChecked():
-                self.tracker.add_installation(install_data)
-                self.load_tracked_installations()  # Refresh list
+            # Track installation
+            self.tracker.add_installation(install_data)
+            self.load_tracked_installations()  # Refresh list
             
             QMessageBox.information(self, "Installation Complete",
                                   "Application installed successfully!\n\n"
-                                  "You can now find it in your application menu.")
+                                  "You can now find it in your application menu.\n"
+                                  "A marker file was created for future detection.")
             self.status_bar.showMessage("Installation completed successfully")
         else:
             self.update_log(f"✗ Error: {message}")
@@ -991,17 +1270,50 @@ class MainWindow(QMainWindow):
             self.cancel_btn.setVisible(False)
             self.status_bar.showMessage("Installation cancelled")
             
-    def on_app_selection_changed(self):
-        """Enable remove button when an app is selected"""
-        self.remove_btn.setEnabled(len(self.apps_list.selectedItems()) > 0)
-        
-    def refresh_apps_list(self):
-        """Refresh list of installed applications"""
+    def scan_installations(self):
+        """Manually scan for marker files"""
+        self.tracker.scan_existing_installations()
         self.load_tracked_installations()
-        self.status_bar.showMessage("Refreshed application list")
         
-    def remove_application(self):
-        """Remove selected application"""
+        count = len(self.tracker.get_installations())
+        self.status_bar.showMessage(f"Found {count} tracked installations")
+        QMessageBox.information(self, "Scan Complete",
+                              f"Scanned for marker files and found {count} installations.")
+    
+    def cleanup_markers(self):
+        """Remove orphaned marker files"""
+        home = Path.home()
+        markers_found = 0
+        markers_removed = 0
+        
+        for marker_file in home.rglob('.tarball-installer-marker.json'):
+            markers_found += 1
+            try:
+                # Check if it's tracked
+                with open(marker_file, 'r') as f:
+                    marker_data = json.load(f)
+                
+                app_id = marker_data.get('app_id')
+                is_tracked = any(inst.get('app_id') == app_id for inst in self.tracker.get_installations())
+                
+                if not is_tracked:
+                    marker_file.unlink()
+                    markers_removed += 1
+            except:
+                pass
+        
+        self.status_bar.showMessage(f"Cleaned up {markers_removed} orphaned markers")
+        QMessageBox.information(self, "Cleanup Complete",
+                              f"Found {markers_found} marker files, removed {markers_removed} orphaned ones.")
+    
+    def on_app_selection_changed(self):
+        """Enable/disable buttons based on selection"""
+        has_selection = len(self.apps_list.selectedItems()) > 0
+        self.uninstall_btn.setEnabled(has_selection)
+        self.remove_tracking_btn.setEnabled(has_selection)
+        
+    def uninstall_application(self):
+        """Completely uninstall selected application"""
         selected_items = self.apps_list.selectedItems()
         if not selected_items:
             return
@@ -1010,33 +1322,127 @@ class MainWindow(QMainWindow):
         app_id = item.data(0, Qt.UserRole)
         app_name = item.text(0)
         
-        reply = QMessageBox.question(self, "Remove Application",
-                                   f"Are you sure you want to remove '{app_name}'?\n\n"
-                                   "This will remove the application from the tracking database "
-                                   "but won't uninstall files. To fully uninstall, please use "
-                                   "your system's package manager or manually remove the files.",
+        # Get installation data
+        install_data = self.tracker.get_installation_by_id(app_id)
+        if not install_data:
+            QMessageBox.warning(self, "Cannot Uninstall",
+                              f"No installation data found for '{app_name}'.")
+            return
+        
+        # Confirm uninstallation
+        reply = QMessageBox.warning(self, "Confirm Uninstallation",
+                                   f"Are you sure you want to completely uninstall '{app_name}'?\n\n"
+                                   "This will:\n"
+                                   "• Remove all installed files\n"
+                                   "• Remove marker files\n"
+                                   "• Remove from tracking database\n"
+                                   "• Update desktop database\n\n"
+                                   "This action cannot be undone!",
+                                   QMessageBox.Yes | QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            # Start uninstallation thread
+            self.uninstall_thread = UninstallThread(install_data)
+            self.uninstall_thread.progress.connect(self.update_uninstall_progress)
+            self.uninstall_thread.log.connect(self.update_uninstall_log)
+            self.uninstall_thread.finished.connect(self.uninstallation_finished)
+            
+            # Show progress dialog
+            self.uninstall_dialog = QDialog(self)
+            self.uninstall_dialog.setWindowTitle(f"Uninstalling {app_name}")
+            self.uninstall_dialog.setFixedSize(500, 300)
+            
+            layout = QVBoxLayout(self.uninstall_dialog)
+            layout.addWidget(QLabel(f"Uninstalling {app_name}..."))
+            
+            self.uninstall_progress = QProgressBar()
+            layout.addWidget(self.uninstall_progress)
+            
+            self.uninstall_log_display = QTextEdit()
+            self.uninstall_log_display.setReadOnly(True)
+            layout.addWidget(self.uninstall_log_display)
+            
+            self.uninstall_dialog.show()
+            self.uninstall_thread.start()
+    
+    def update_uninstall_progress(self, message, value):
+        if hasattr(self, 'uninstall_progress'):
+            self.uninstall_progress.setValue(value)
+            self.update_uninstall_log(f"[{value}%] {message}")
+    
+    def update_uninstall_log(self, message):
+        if hasattr(self, 'uninstall_log_display'):
+            self.uninstall_log_display.append(message)
+            cursor = self.uninstall_log_display.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            self.uninstall_log_display.setTextCursor(cursor)
+    
+    def uninstallation_finished(self, success, message):
+        if hasattr(self, 'uninstall_dialog'):
+            self.uninstall_dialog.accept()
+        
+        if success:
+            # Remove from tracking database
+            selected_items = self.apps_list.selectedItems()
+            if selected_items:
+                app_id = selected_items[0].data(0, Qt.UserRole)
+                self.tracker.remove_installation(app_id)
+                self.load_tracked_installations()
+            
+            QMessageBox.information(self, "Uninstallation Complete", message)
+            self.status_bar.showMessage("Application uninstalled successfully")
+        else:
+            QMessageBox.critical(self, "Uninstallation Failed", message)
+            self.status_bar.showMessage("Uninstallation failed")
+            
+    def remove_from_tracking(self):
+        """Remove selected application from tracking only"""
+        selected_items = self.apps_list.selectedItems()
+        if not selected_items:
+            return
+            
+        item = selected_items[0]
+        app_id = item.data(0, Qt.UserRole)
+        app_name = item.text(0)
+        
+        reply = QMessageBox.question(self, "Remove from Tracking",
+                                   f"Remove '{app_name}' from tracking?\n\n"
+                                   "This will remove the app from the tracking database "
+                                   "but won't delete any installed files or marker files.\n\n"
+                                   "The app will be redetected if you scan for markers again.",
                                    QMessageBox.Yes | QMessageBox.No)
         
         if reply == QMessageBox.Yes:
             self.tracker.remove_installation(app_id)
             self.load_tracked_installations()
             self.status_bar.showMessage(f"Removed from tracking: {app_name}")
-            
+        
+    def refresh_apps_list(self):
+        """Refresh list of installed applications"""
+        self.load_tracked_installations()
+        self.status_bar.showMessage("Refreshed application list")
+        
     def show_about_dialog(self):
         about_text = """
         <h3>Tarball Installer</h3>
         <p>Version 1.0.0</p>
         <p>A graphical tool for installing software from tarball archives.</p>
         
-        <p><b>Features:</b></p>
+        <p><b>Key Features:</b></p>
         <ul>
-        <li>Package analysis and preview</li>
+        <li>Detailed package analysis in dedicated tab</li>
         <li>System integration (desktop entries, icons)</li>
-        <li>Installation tracking for easy removal</li>
+        <li>Installation tracking with marker files</li>
+        <li>Automatic detection of existing installations on startup</li>
+        <li>Complete uninstallation with file removal</li>
         <li>User or system-wide installation</li>
         </ul>
         
-        <p><b>Note:</b> Most tarballs can be run directly without installation.<br>
+        <p><b>Marker Files:</b><br>
+        Creates <code>.tarball-installer-marker.json</code> files to track installations
+        even after reinstalls or app deletions.</p>
+        
+        <p><b>Note:</b> Most tarballs can be run directly without installation.
         This tool provides system integration for better user experience.</p>
         
         <p>© 2025 Chief Denis</p>
