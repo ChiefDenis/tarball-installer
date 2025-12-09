@@ -1,0 +1,23 @@
+app-id: com.yourname.tarballinstaller
+runtime: org.kde.Platform
+runtime-version: '6.7'
+sdk: org.kde.Sdk
+command: tarball-installer
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --filesystem=home
+  - --filesystem=xdg-download
+  - --talk-name=org.freedesktop.Flatpak
+modules:
+  - name: tarball-installer
+    buildsystem: simple
+    build-commands:
+      - pip3 install --prefix=/app --no-deps .
+      - install -Dm644 data/com.yourname.tarballinstaller.desktop /app/share/applications/com.yourname.tarballinstaller.desktop
+      - install -Dm644 data/com.yourname.tarballinstaller.appdata.xml /app/share/metainfo/com.yourname.tarballinstaller.appdata.xml
+    sources:
+      - type: dir
+        path: ..

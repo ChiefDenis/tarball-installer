@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.chiefdenis.tarballinstaller.desktop</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Tarball Installer</name>
+  <summary>Install tarballs as native applications</summary>
+  <description>
+    <p>
+      A modern, user-friendly application for installing software from tarball archives.
+      Converts downloaded .tar.gz, .tar.bz2, and .tar.xz files into properly integrated
+      desktop applications with menu entries and proper system integration.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Simple graphical interface for tarball installation</li>
+      <li>Automatic desktop entry creation</li>
+      <li>User or system-wide installation options</li>
+      <li>Package analysis and preview</li>
+      <li>Installation logging</li>
+      <li>Modern GNOME-inspired interface</li>
+    </ul>
+  </description>
+  <url type="homepage">https://github.com/chiefdenis/tarball-installer</url>
+  <developer_name>Chief Denis</developer_name>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Main installation interface</caption>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <release version="1.0.0" date="2024-01-01">
+      <description>
+        <p>Initial release</p>
+      </description>
+    </release>
+  </releases>
+  <content_rating type="oars-1.1" />
+</component>
