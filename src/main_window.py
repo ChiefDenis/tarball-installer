@@ -1,5 +1,5 @@
 # Version constant at the top
-__version__ = "0.23.0"
+__version__ = "0.23.6"
 
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                               QPushButton, QLabel, QFileDialog, QTextEdit,
@@ -181,6 +181,305 @@ class InstallerThread(QThread):
         except Exception as e:
             self.log.emit(f"Error: {str(e)}")
             self.finished.emit(False, str(e), {})
+
+    def find_desktop_files(self):
+        desktop_files = []
+        for root, dirs, files in os.walk(self.temp_dir):
+            for file in files:
+                if file.endswith('.desktop'):
+                    desktop_files.append(os.path.join(root, file))
+        return desktop_files
+    
+    def find_binaries(self):
+        """Find executable binaries - FIXED to include executables without extensions"""
+        binaries = []
+        for root, dirs, files in os.walk(self.temp_dir):
+            for file in files:
+                filepath = os.path.join(root, file)
+                if os.access(filepath, os.X_OK):
+                    # Check if it's likely an executable
+                    try:
+                        with open(filepath, 'rb') as f:
+                            magic = f.read(4)
+                            # ELF binary or script with shebang
+                            if magic.startswith(b'#!') or magic.startswith(b'\x7fELF'):
+                                binaries.append(filepath)
+                            # Also include files without extensions that are executable
+                            # (common for many Linux applications)
+                            elif '.' not in file and os.path.getsize(filepath) > 100:
+                                # Check if it contains non-text data (likely binary)
+                                with open(filepath, 'rb') as f:
+                                    sample = f.read(1024)
+                                    # If mostly non-ASCII, likely a binary
+                                    if any(b > 127 for b in sample):
+                                        binaries.append(filepath)
+                    except:
+                        pass
+        return binaries
+    
+    def find_extraction_root(self, temp_dir):
+        """Find the actual root directory where tarball contents were extracted"""
+        # List contents of temp_dir
+        items = os.listdir(temp_dir)
+        
+        # If there's only one item and it's a directory, that's likely the root
+        if len(items) == 1 and os.path.isdir(os.path.join(temp_dir, items[0])):
+            return os.path.join(temp_dir, items[0])
+        
+        # Otherwise, return the temp_dir itself
+        return temp_dir
+    
+    def find_icons(self):
+        icons = []
+        icon_extensions = ['.png', '.svg', '.xpm', '.ico']
+        for root, dirs, files in os.walk(self.temp_dir):
+            for file in files:
+                if any(file.lower().endswith(ext) for ext in icon_extensions):
+                    if 'icon' in file.lower() or 'icons' in root.lower():
+                        icons.append(os.path.join(root, file))
+        return icons
+    
+    def identify_main_binary(self, binaries, desktop_files):
+        if not binaries:
+            return None
+        
+        # Check desktop file first
+        if desktop_files:
+            desktop_info = self.parse_desktop_file(desktop_files[0])
+            exec_cmd = desktop_info.get('exec', '')
+            if exec_cmd:
+                exec_binary = exec_cmd.split()[0] if ' ' in exec_cmd else exec_cmd
+                exec_binary = os.path.basename(exec_binary)
+                for binary in binaries:
+                    if os.path.basename(binary) == exec_binary:
+                        return binary
+        
+        # Simple scoring
+        scored_binaries = []
+        for binary in binaries:
+            score = 0
+            bin_name = os.path.basename(binary)
+            bin_path = binary.lower()
+            
+            # Prefer files in bin directories
+            if 'bin' in bin_path:
+                score += 10
+            
+            # Prefer files without extensions (most Linux executables)
+            if '.' not in bin_name:
+                score += 8
+            elif bin_name.endswith(('.sh', '.py', '.pl')):
+                score += 3
+            
+            # Common main executable names
+            main_names = ['app', 'main', 'run', 'start', 'launch']
+            for name in main_names:
+                if name in bin_name.lower():
+                    score += 5
+                    break
+            
+            # Avoid clear uninstallers if we have alternatives
+            if 'uninstall' in bin_name.lower() or 'remove' in bin_name.lower():
+                score -= 3
+            
+            scored_binaries.append((binary, score, bin_name))
+        
+        scored_binaries.sort(key=lambda x: x[1], reverse=True)
+        
+        # Log scoring results for debugging
+        self.log.emit("Binary scoring results:")
+        for binary, score, name in scored_binaries[:3]:  # Top 3
+            self.log.emit(f"  {name}: {score} points")
+        
+        return scored_binaries[0][0] if scored_binaries else binaries[0]
+    
+    def parse_desktop_file(self, desktop_path):
+        try:
+            with open(desktop_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Simple parsing of key=value pairs in [Desktop Entry] section
+            lines = content.split('\n')
+            in_desktop_entry = False
+            result = {}
+            
+            for line in lines:
+                line = line.strip()
+                if line == '[Desktop Entry]':
+                    in_desktop_entry = True
+                elif line.startswith('[') and line.endswith(']'):
+                    in_desktop_entry = False
+                elif in_desktop_entry and '=' in line:
+                    key, value = line.split('=', 1)
+                    result[key] = value
+            
+            return {
+                'name': result.get('Name', 'Unknown'),
+                'comment': result.get('Comment', ''),
+                'exec': result.get('Exec', ''),
+                'icon': result.get('Icon', ''),
+                'categories': result.get('Categories', '').split(';'),
+                'version': result.get('Version', '1.0')
+            }
+        except:
+            pass
+        return {}    
+    
+    def create_marker_file(self, directory, app_info):
+        marker_data = {
+            'installed_by': 'Tarball Installer',
+            'installer_version': __version__,
+            'app_id': self.installation_data['app_id'],
+            'app_name': app_info.get('name', os.path.basename(self.tarball_path)),
+            'app_version': app_info.get('version', '1.0'),
+            'install_time': datetime.now().isoformat(),
+            'install_type': self.options.get('install_type', 'user'),
+            'tarball_source': os.path.basename(self.tarball_path)
+        }
+        
+        marker_path = directory / '.tarball-installer-marker.json'
+        with open(marker_path, 'w') as f:
+            json.dump(marker_data, f, indent=2)
+        
+        return str(marker_path)
+
+    def install_to_user(self, desktop_files, binaries, icons, main_binary):
+        home = Path.home()
+        local_bin = home / '.local' / 'bin'
+        local_apps = home / '.local' / 'share' / 'applications'
+        local_icons = home / '.local' / 'share' / 'icons'
+        
+        local_bin.mkdir(parents=True, exist_ok=True)
+        local_apps.mkdir(parents=True, exist_ok=True)
+        local_icons.mkdir(parents=True, exist_ok=True)
+        
+        install_data = {
+            'install_path': str(local_bin),
+            'desktop_path': str(local_apps),
+            'installed_files': [],
+            'marker_files': []
+        }
+        
+        # Get app info from existing desktop file
+        app_info = {}
+        if desktop_files:
+            app_info = self.parse_desktop_file(desktop_files[0])
+            if app_info.get('name'):
+                self.installation_data['app_name'] = app_info['name']
+                self.installation_data['app_version'] = app_info.get('version', '1.0')
+        else:
+            # Create app name from filename
+            app_name = os.path.basename(self.tarball_path)
+            app_name = re.sub(r'\.(tar\.gz|tar\.bz2|tar\.xz|tgz|tbz2|txz)$', '', app_name)
+            app_name = re.sub(r'[-_]', ' ', app_name).title()
+            self.installation_data['app_name'] = app_name
+            self.installation_data['app_version'] = '1.0'
+            app_info = {'name': app_name, 'version': '1.0'}
+        
+        # ==== FIXED PART: Install ENTIRE app to ~/Applications/ ====
+        applications_dir = home / 'Applications'
+        applications_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Find where the app was actually extracted in temp_dir
+        extracted_root = self.find_extraction_root(self.temp_dir)
+        app_base_name = os.path.basename(extracted_root)
+        permanent_install_dir = applications_dir / app_base_name
+        
+        # Copy ENTIRE app directory to ~/Applications/
+        if permanent_install_dir.exists():
+            shutil.rmtree(permanent_install_dir)
+        shutil.copytree(extracted_root, permanent_install_dir)
+        
+        # Update install_data to track this
+        install_data['app_install_dir'] = str(permanent_install_dir)
+        
+        # Create marker file in the app directory
+        marker_path = self.create_marker_file(permanent_install_dir, app_info)
+        install_data['marker_files'].append(marker_path)
+        self.log.emit(f"Created marker file: {marker_path}")
+        
+        # ==== Create launchers in ~/.local/bin/ ====
+        for binary in binaries:
+            binary_name = os.path.basename(binary)
+            launcher_path = local_bin / binary_name
+            
+            # Find binary relative to extracted_root
+            binary_rel_path = os.path.relpath(binary, extracted_root)
+            
+            # Create launcher script that cd's to app directory
+            with open(launcher_path, 'w') as f:
+                f.write(f'''#!/bin/bash
+cd "{permanent_install_dir}"
+exec "./{binary_rel_path}" "$@"
+''')
+            launcher_path.chmod(0o755)
+            install_data['installed_files'].append(str(launcher_path))
+            self.log.emit(f"Created launcher: {launcher_path}")
+        
+        # ==== Install desktop files (update Exec paths) ====
+        for desktop in desktop_files:
+            dest = local_apps / os.path.basename(desktop)
+            
+            try:
+                with open(desktop, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                
+                # Update Exec lines to use our launchers
+                for i, line in enumerate(lines):
+                    if line.startswith('Exec='):
+                        exec_line = line[5:].strip()
+                        exec_parts = exec_line.split()
+                        if exec_parts:
+                            binary_name = os.path.basename(exec_parts[0])
+                            # Keep arguments (%f, %u, etc.)
+                            args = ' ' + ' '.join(exec_parts[1:]) if len(exec_parts) > 1 else ''
+                            lines[i] = f'Exec={local_bin}/{binary_name}{args}\n'
+                
+                with open(dest, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+                
+                install_data['installed_files'].append(str(dest))
+                self.log.emit(f"Installed desktop entry: {dest}")
+                
+            except Exception as e:
+                self.log.emit(f"Warning: Could not update desktop file: {e}")
+                shutil.copy2(desktop, dest)
+                install_data['installed_files'].append(str(dest))
+        
+        # ==== Install icons ====
+        for icon in icons:
+            icon_name = os.path.basename(icon)
+            icon_ext = os.path.splitext(icon_name)[1].lower()
+            
+            # Default to scalable
+            size_dir = 'scalable'
+            if icon_ext == '.png':
+                # Try to detect size
+                for size in ['16x16', '32x32', '48x48', '64x64', '128x128', '256x256', '512x512']:
+                    if size in icon or size.replace('x', '') in icon_name:
+                        size_dir = size
+                        break
+            
+            dest_dir = local_icons / 'hicolor' / size_dir / 'apps'
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / icon_name
+            shutil.copy2(icon, dest)
+            install_data['installed_files'].append(str(dest))
+        
+        # Update desktop database
+        try:
+            subprocess.run(['update-desktop-database', str(local_apps)], check=True)
+            self.log.emit("Updated desktop database")
+        except subprocess.CalledProcessError as e:
+            self.log.emit(f"Warning: Failed to update desktop database: {e}")
+        
+        return install_data    
+    
+    def install_system_wide(self, desktop_files, binaries, icons, main_binary):
+        # For now, just call install_to_user since system-wide requires root
+        # In a real implementation, this would install to /usr/local/bin, /usr/share/applications, etc.
+        self.log.emit("System-wide installation not yet implemented. Falling back to user installation.")
+        return self.install_to_user(desktop_files, binaries, icons, main_binary)               
 
 class UninstallThread(QThread):
     progress = Signal(str, int)
@@ -933,32 +1232,79 @@ class MainWindow(QMainWindow):
         except Exception as e:
             # Clean up on error
             self.cleanup_temp_dirs()
-            QMessageBox.warning(self, "Analysis Error", f"Could not analyze package:\n{str(e)}")
-    
+            QMessageBox.warning(self, "Analysis Error", f"Could not analyze package:\n{str(e)}")    
+
     def select_binary_manually(self):
-        """Simple file picker for manual binary selection - REUSES existing extraction"""
-        if not hasattr(self, 'temp_analysis_dir') or not self.temp_analysis_dir or not os.path.exists(self.temp_analysis_dir):
-            QMessageBox.warning(self, "No Analysis Data", "Please analyze the package first before selecting a binary.")
+        """Simple file picker for manual binary selection - extracts only when needed"""
+        if not self.current_file:
+            QMessageBox.warning(self, "No File Selected", "Please select a tarball file first.")
             return
         
-        # Use the already-extracted directory from analysis
-        extracted_root = self.find_extraction_root(self.temp_analysis_dir)
-        binary_path, _ = QFileDialog.getOpenFileName(
+        # Ask user if they want to extract for manual selection
+        file_name = os.path.basename(self.current_file)
+        file_size = os.path.getsize(self.current_file) / (1024 * 1024)
+        
+        reply = QMessageBox.question(
             self,
-            "Select Main Executable",
-            extracted_root,
-            "Executable files (*);;All files (*.*)"
+            "Extract for Manual Selection",
+            f"To select a binary manually, the tarball needs to be extracted.\n\n"
+            f"File: {file_name}\n"
+            f"Size: {file_size:.1f} MB\n\n"
+            f"This will extract to a temporary location.\n"
+            f"Do you want to continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
         )
         
-        if binary_path and os.path.exists(binary_path):
-            # Make it relative to the extraction root
-            try:
-                rel_path = os.path.relpath(binary_path, extracted_root)
-                self.user_selected_binary = rel_path
-                self.selected_binary_label.setText(f"Selected: {os.path.basename(binary_path)}")
-                self.clear_selection_btn.setEnabled(True)
-            except ValueError as e:
-                QMessageBox.warning(self, "Selection Error", f"Could not determine relative path: {str(e)}")
+        if reply != QMessageBox.Yes:
+            return
+        
+        # Clean up any previous temp dirs
+        self.cleanup_temp_dirs()
+        
+        # Create temp directory for extraction
+        self.temp_analysis_dir = tempfile.mkdtemp(prefix="tarball_select_")
+        try:
+            self.status_bar.showMessage(f"Extracting {file_name}...")
+            
+            # Extract with progress
+            with tarfile.open(self.current_file, 'r:*') as tar:
+                members = tar.getmembers()
+                total_members = len(members)
+                
+                # Extract all files
+                for i, member in enumerate(members):
+                    tar.extract(member, self.temp_analysis_dir)
+                    if i % 100 == 0:  # Update progress every 100 files
+                        progress = int((i / total_members) * 100)
+                        self.status_bar.showMessage(f"Extracting: {progress}%")
+            
+            # Use the extracted directory
+            extracted_root = self.find_extraction_root(self.temp_analysis_dir)
+            binary_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Main Executable",
+                extracted_root,
+                "Executable files (*);;All files (*.*)"
+            )
+            
+            if binary_path and os.path.exists(binary_path):
+                # Make it relative to the extraction root
+                try:
+                    rel_path = os.path.relpath(binary_path, extracted_root)
+                    self.user_selected_binary = rel_path
+                    self.selected_binary_label.setText(f"Selected: {os.path.basename(binary_path)}")
+                    self.clear_selection_btn.setEnabled(True)
+                    self.status_bar.showMessage(f"Selected: {os.path.basename(binary_path)}")
+                except ValueError as e:
+                    QMessageBox.warning(self, "Selection Error", f"Could not determine relative path: {str(e)}")
+            else:
+                self.status_bar.showMessage("No binary selected")
+                
+        except Exception as e:
+            QMessageBox.warning(self, "Extraction Error", f"Could not extract package for manual selection:\n{str(e)}")
+            # Clean up on error
+            self.cleanup_temp_dirs()
 
     def find_extraction_root(self, temp_dir):
         """Find the actual root directory where tarball contents were extracted"""
