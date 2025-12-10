@@ -1,5 +1,5 @@
 # Version constant at the top
-__version__ = "0.23.6"
+__version__ = "0.25.0"
 
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                               QPushButton, QLabel, QFileDialog, QTextEdit,
@@ -92,6 +92,86 @@ class WelcomeDialog(QDialog):
         button_box = QDialogButtonBox(QDialogButtonBox.Ok)
         button_box.accepted.connect(self.accept)
         layout.addWidget(button_box)
+
+class InstallationLogDialog(QDialog):
+    def __init__(self, log_text, parent=None):
+        super().__init__(parent)
+        self.setup_ui(log_text)
+        
+    def setup_ui(self, log_text):
+        self.setWindowTitle("Installation Log")
+        self.setMinimumSize(700, 500)
+        
+        layout = QVBoxLayout(self)
+        
+        # Title
+        title = QLabel("Installation Log")
+        title_font = QFont()
+        title_font.setPointSize(14)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Log display
+        self.log_display = QTextEdit()
+        self.log_display.setReadOnly(True)
+        self.log_display.setFont(QFont("Monospace", 9))
+        self.log_display.setPlainText(log_text)
+        
+        # Add line numbers
+        self.add_line_numbers()
+        
+        layout.addWidget(self.log_display)
+        
+        # Buttons
+        button_box = QHBoxLayout()
+        
+        copy_btn = QPushButton("Copy to Clipboard")
+        copy_btn.clicked.connect(self.copy_to_clipboard)
+        
+        save_btn = QPushButton("Save to File...")
+        save_btn.clicked.connect(self.save_to_file)
+        
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        close_btn.setDefault(True)
+        
+        button_box.addWidget(copy_btn)
+        button_box.addWidget(save_btn)
+        button_box.addStretch()
+        button_box.addWidget(close_btn)
+        
+        layout.addLayout(button_box)
+    
+    def add_line_numbers(self):
+        """Simple line number formatting"""
+        lines = self.log_display.toPlainText().split('\n')
+        numbered_lines = []
+        for i, line in enumerate(lines, 1):
+            numbered_lines.append(f"{i:4d} | {line}")
+        self.log_display.setPlainText('\n'.join(numbered_lines))
+    
+    def copy_to_clipboard(self):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.log_display.toPlainText())
+        QMessageBox.information(self, "Copied", "Log copied to clipboard!")
+    
+    def save_to_file(self):
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Installation Log",
+            str(Path.home() / "tarball-installer-log.txt"),
+            "Text files (*.txt);;All files (*.*)"
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'w') as f:
+                    f.write(self.log_display.toPlainText())
+                QMessageBox.information(self, "Saved", f"Log saved to:\n{file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Save Error", f"Could not save file:\n{str(e)}")        
 
 class InstallerThread(QThread):
     progress = Signal(str, int)
@@ -661,9 +741,39 @@ class MainWindow(QMainWindow):
         self.detected_binaries = []
         self.user_selected_binary = None
         
+        # Load settings
+        self.settings_path = Path.home() / '.config' / 'tarball-installer' / 'settings.json'
+        self.load_settings()
+        
+        #Store installation log
+        self.installation_log = ""
+        
         self.setup_ui()
         self.setup_style()
         self.show_welcome_dialog()
+    
+    def load_settings(self):
+        """Load user settings"""
+        self.settings = {'show_log_after_install': True}  # Default to showing log
+        
+        if self.settings_path.exists():
+            try:
+                with open(self.settings_path, 'r') as f:
+                    saved_settings = json.load(f)
+                    self.settings.update(saved_settings)
+            except:
+                pass
+    
+    def save_settings(self):
+        """Save user settings"""
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.settings_path, 'w') as f:
+            json.dump(self.settings, f, indent=2)
+    
+    def on_log_preference_changed(self):
+        """Save user preference for showing log"""
+        self.settings['show_log_after_install'] = self.show_log_checkbox.isChecked()
+        self.save_settings()
         
     def show_welcome_dialog(self):
         settings_path = Path.home() / '.config' / 'tarball-installer' / 'settings.json'
@@ -738,18 +848,7 @@ class MainWindow(QMainWindow):
         
         self.setup_menu_bar()
         
-        header_widget = QWidget()
-        header_layout = QVBoxLayout(header_widget)
-        header_layout.setContentsMargins(0, 0, 0, 8)
-        
-        title = QLabel(f"Tarball Installer v{__version__}")
-        title.setObjectName("title")
-        subtitle = QLabel("Install and manage applications from tarball archives")
-        subtitle.setObjectName("subtitle")
-        
-        header_layout.addWidget(title)
-        header_layout.addWidget(subtitle)
-        main_layout.addWidget(header_widget)
+        # Removed header widgets to save space        
         
         self.tab_widget = QTabWidget()
         self.setup_install_tab()
@@ -794,6 +893,11 @@ class MainWindow(QMainWindow):
         cleanup_action = QAction("&Cleanup Orphaned Markers", self)
         cleanup_action.triggered.connect(self.cleanup_markers)
         tools_menu.addAction(cleanup_action)
+        
+        # NEW: View last installation log
+        view_log_action = QAction("View &Last Installation Log", self)
+        view_log_action.triggered.connect(self.view_last_log)
+        tools_menu.addAction(view_log_action)
         
         help_menu = menubar.addMenu("&Help")
         about_action = QAction("&About", self)
@@ -887,6 +991,13 @@ class MainWindow(QMainWindow):
         self.create_desktop_entry = QCheckBox("Create application menu entry")
         self.create_desktop_entry.setChecked(True)
         options_layout.addWidget(self.create_desktop_entry)
+        
+        # Option to show log after installation
+        self.show_log_checkbox = QCheckBox("Show installation log when complete")
+        self.show_log_checkbox.setChecked(self.settings.get('show_log_after_install', True))
+        self.show_log_checkbox.stateChanged.connect(self.on_log_preference_changed)
+        options_layout.addWidget(self.show_log_checkbox)
+        
         options_group.setLayout(options_layout)
         left_layout.addWidget(options_group)
         
@@ -1343,15 +1454,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Package Not Analyzed", "Please analyze the package first before installing.")
             return
         
+        # NEW: Reset installation log
+        self.installation_log = ""
+        self.log_display.clear()
+        
         selected_binary_for_installer = None
         if self.user_selected_binary:
             # Convert relative path to absolute path in the extracted directory
             extracted_root = self.find_extraction_root(self.temp_analysis_dir)
-            selected_binary_for_installer = os.path.join(extracted_root, self.user_selected_binary)
+            if self.user_selected_binary:
+                selected_binary_for_installer = os.path.join(extracted_root, self.user_selected_binary)
         
         self.progress_group.setVisible(True)
         self.progress_bar.setValue(0)
-        self.log_display.clear()
         self.install_btn.setEnabled(False)
         self.cancel_btn.setVisible(True)
         
@@ -1361,6 +1476,7 @@ class MainWindow(QMainWindow):
             'create_desktop_entry': self.create_desktop_entry.isChecked()
         }
         
+        # THIS WAS MISSING - creating and starting the thread!
         self.installer_thread = InstallerThread(
             self.current_file,
             options,
@@ -1373,18 +1489,25 @@ class MainWindow(QMainWindow):
         self.installer_thread.start()
         
         self.status_bar.showMessage("Installing...")
-        
+                
     def update_progress(self, message, value):
         self.progress_bar.setValue(value)
         self.update_log(f"[{value}%] {message}")
         
     def update_log(self, message):
+        # Store in installation log
+        self.installation_log += message + "\n"
+        
+        # Display in UI
         self.log_display.append(message)
         cursor = self.log_display.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         self.log_display.setTextCursor(cursor)
         
     def installation_finished(self, success, message, install_data):
+        # Clean up temp directory after installation (success or failure)
+        self.cleanup_temp_dirs()
+        
         self.progress_bar.setValue(100)
         
         if success:
@@ -1397,21 +1520,50 @@ class MainWindow(QMainWindow):
             main_binary = install_data.get('main_binary')
             binary_info = f"\nExecutable: {os.path.basename(main_binary)}" if main_binary else ""
             
-            QMessageBox.information(self, "Installation Complete",
-                                  f"Application installed successfully!{binary_info}\n\n"
-                                  "You can now find it in your application menu.")
+            # Show success message
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Installation Complete")
+            msg_box.setText(f"Application installed successfully!{binary_info}\n\nYou can now find it in your application menu.")
+            
+            # Add "Show Log" button if user wants to see it
+            if self.settings.get('show_log_after_install', True):
+                show_log_btn = msg_box.addButton("Show Installation Log", QMessageBox.ActionRole)
+                msg_box.addButton("OK", QMessageBox.AcceptRole)
+            else:
+                msg_box.addButton("OK", QMessageBox.AcceptRole)
+            
+            msg_box.exec()
+            
+            # Check which button was clicked
+            if self.settings.get('show_log_after_install', True) and msg_box.clickedButton() == show_log_btn:
+                self.show_installation_log()
+            
             self.status_bar.showMessage("Installation completed successfully")
         else:
             self.update_log(f"✗ Error: {message}")
-            QMessageBox.critical(self, "Installation Failed", f"Installation failed:\n{message}")
+            
+            # Always show log on error
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Installation Failed")
+            msg_box.setText(f"Installation failed:\n{message}")
+            msg_box.setIcon(QMessageBox.Critical)
+            
+            show_log_btn = msg_box.addButton("Show Error Log", QMessageBox.ActionRole)
+            msg_box.addButton("OK", QMessageBox.AcceptRole)
+            
+            msg_box.exec()
+            
+            if msg_box.clickedButton() == show_log_btn:
+                self.show_installation_log()
+            
             self.status_bar.showMessage("Installation failed")
         
-        # Clean up temp directory after installation (success or failure)
-        self.cleanup_temp_dirs()
+        # Clear installation log for next time
+        self.installation_log = ""
         
         self.install_btn.setEnabled(True)
         self.cancel_btn.setVisible(False)
-        
+
     def cancel_installation(self):
         if hasattr(self, 'installer_thread') and self.installer_thread.isRunning():
             self.installer_thread.terminate()
@@ -1440,6 +1592,11 @@ class MainWindow(QMainWindow):
         has_selection = len(self.apps_list.selectedItems()) > 0
         self.uninstall_btn.setEnabled(has_selection)
         self.remove_tracking_btn.setEnabled(has_selection)
+
+    def show_installation_log(self):
+        """Show installation log in a dialog"""
+        dialog = InstallationLogDialog(self.installation_log, self)
+        dialog.exec()        
         
     def uninstall_application(self):
         selected_items = self.apps_list.selectedItems()
@@ -1555,6 +1712,15 @@ class MainWindow(QMainWindow):
         """
         
         QMessageBox.about(self, "About Tarball Installer", about_text)
+
+    def view_last_log(self):
+        """View the last installation log"""
+        if not self.installation_log:
+            QMessageBox.information(self, "No Log", "No installation log available.")
+            return
+        
+        dialog = InstallationLogDialog(self.installation_log, self)
+        dialog.exec()        
 
     def closeEvent(self, event):
         """Clean up when window closes"""
